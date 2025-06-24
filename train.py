@@ -14,7 +14,8 @@ from resnet import resnet12
 from util import str2bool, set_gpu, ensure_path, save_checkpoint, count_acc, seed_torch, Averager, compute_confidence_interval, normalize, Timer
 from sklearn import metrics
 from sklearn.linear_model import LogisticRegression
-
+import random
+from itertools import permutations
 import torch.backends.cudnn as cudnn
 
 def get_dataset(args):
@@ -50,7 +51,62 @@ def get_dataset(args):
     val_loader = DataLoader(dataset=valset, batch_sampler=val_sampler,
                             num_workers=args.worker, pin_memory=True)
     return train_loader, val_loader, n_cls
+def create_jigsaw_puzzle(image, grid_size=3):
+    """創建拼圖任務"""
+    batch_size, channels, height, width = image.shape
+    patch_size_h = height // grid_size
+    patch_size_w = width // grid_size
+    
+    # 分割圖像為patches
+    patches = []
+    for i in range(grid_size):
+        for j in range(grid_size):
+            patch = image[:, :, i*patch_size_h:(i+1)*patch_size_h, 
+                         j*patch_size_w:(j+1)*patch_size_w]
+            patches.append(patch)
+    
+    # 預定義一些排列組合（減少計算複雜度）
+    predefined_perms = list(permutations(range(grid_size*grid_size)))[:100]
+    
+    shuffled_images = []
+    perm_labels = []
+    
+    for b in range(batch_size):
+        # 隨機選擇一個排列
+        perm_idx = random.randint(0, len(predefined_perms)-1)
+        perm = predefined_perms[perm_idx]
+        
+        # 重新排列patches
+        shuffled_patches = [patches[perm[i]][b:b+1] for i in range(len(perm))]
+        
+        # 重組圖像
+        rows = []
+        for i in range(grid_size):
+            row_patches = shuffled_patches[i*grid_size:(i+1)*grid_size]
+            row = torch.cat(row_patches, dim=3)
+            rows.append(row)
+        shuffled_image = torch.cat(rows, dim=2)
+        shuffled_images.append(shuffled_image)
+        perm_labels.append(perm_idx)
+    
+    return torch.cat(shuffled_images, dim=0), torch.tensor(perm_labels)
 
+def create_masked_images(image, mask_ratio=0.15):
+    """創建遮擋任務"""
+    batch_size, channels, height, width = image.shape
+    masked_images = image.clone()
+    
+    for b in range(batch_size):
+        # 隨機選擇要遮擋的位置
+        num_masked = int(height * width * mask_ratio)
+        flat_indices = torch.randperm(height * width)[:num_masked]
+        
+        for idx in flat_indices:
+            h_idx = idx // width
+            w_idx = idx % width
+            masked_images[b, :, h_idx, w_idx] = 0  # 用0遮擋
+    
+    return masked_images
 def main(args):
     if args.detail:
         print("=> Training begin...")
@@ -149,13 +205,16 @@ def dist_loss(data, batch_size):
 
     return loss_a
 
-def preprocess_data(data):
+def preprocess_data(data , task_type='all'):
+    processed_data = {}
+    
     for idxx, img in enumerate(data):
-        # 4,3,84,84
+        # 原始圖像和旋轉變體
         x = img.data[0].unsqueeze(0)
         x90 = img.data[1].unsqueeze(0).transpose(2,3).flip(2)
         x180 = img.data[2].unsqueeze(0).flip(2).flip(3)
         x270 = img.data[3].unsqueeze(0).flip(2).transpose(2,3)
+        
         if idxx <= 0:
             xlist = x
             x90list = x90
@@ -166,8 +225,23 @@ def preprocess_data(data):
             x90list = torch.cat((x90list, x90), 0)
             x180list = torch.cat((x180list, x180), 0)
             x270list = torch.cat((x270list, x270), 0)
-    # combine
-    return torch.cat((xlist, x90list, x180list, x270list), 0).cuda()
+    
+    # 旋轉任務數據
+    processed_data['rotation'] = torch.cat((xlist, x90list, x180list, x270list), 0).cuda()
+    
+    if task_type in ['all', 'jigsaw']:
+        # 拼圖任務數據
+        jigsaw_images, jigsaw_labels = create_jigsaw_puzzle(xlist)
+        processed_data['jigsaw'] = jigsaw_images.cuda()
+        processed_data['jigsaw_labels'] = jigsaw_labels.cuda()
+    
+    if task_type in ['all', 'masked']:
+        # 遮擋重建任務數據
+        masked_images = create_masked_images(xlist)
+        processed_data['masked'] = masked_images.cuda()
+        processed_data['original'] = xlist.cuda()
+    
+    return processed_data
 
 def train(args, dataloader, model, optimizer):
     model.train()
@@ -177,43 +251,67 @@ def train(args, dataloader, model, optimizer):
 
     for i, (inputs, target) in enumerate(dataloader, 1):
         target = target.cuda()
-        #ssl content
-        inputs = preprocess_data(inputs['data'])
-        target = target.repeat(4)
+        
+        # 多任務數據預處理
+        processed_data = preprocess_data(inputs['data'], 'all')
+        target = target.repeat(4)  # 為旋轉任務重複標籤
 
+        # 旋轉標籤
         rot_labels = torch.zeros(4*args.batch_size).cuda().long()
-        for i in range(4*args.batch_size):
-            if i < args.batch_size:
-                rot_labels[i] = 0
-            elif i < 2*args.batch_size:
-                rot_labels[i] = 1
-            elif i < 3*args.batch_size:
-                rot_labels[i] = 2
+        for j in range(4*args.batch_size):  # 改為 j
+            if j < args.batch_size:
+                rot_labels[j] = 0
+            elif j < 2*args.batch_size:
+                rot_labels[j] = 1
+            elif j < 3*args.batch_size:
+                rot_labels[j] = 2
             else:
-                rot_labels[i] = 3
+                rot_labels[j] = 3
 
-        _, train_logit, rot_logits = model(inputs, ssl=True)
-        rot_labels = F.one_hot(rot_labels.to(torch.int64), 4).float()
-        # rotation loss
+        # 計算各任務損失
+        total_loss = 0
+        
+        # 1. 旋轉任務
+        _, train_logit, rot_logits = model(processed_data['rotation'], ssl=True)
+        rot_labels_onehot = F.one_hot(rot_labels.to(torch.int64), 4).float()
         loss_rot = torch.sum(F.binary_cross_entropy_with_logits(
-            input=rot_logits, target=rot_labels))
+            input=rot_logits, target=rot_labels_onehot))
         loss_rot = args.gamma_rot * loss_rot
-        # distance loss
+        
+        # 2. 對比學習（距離損失）
         loss_dist = dist_loss(train_logit, args.batch_size)
         if(torch.isnan(loss_dist).any()):
             print("Skip this loop")
             break
         loss_dist = args.gamma_dist * (loss_dist / 3.0)
-        # base class loss
+        
+        # 3. 基礎分類損失
         loss_ce = F.cross_entropy(train_logit, target)
-        loss = loss_ce + loss_rot + loss_dist
+        
+        # 4. 拼圖任務
+        if hasattr(args, 'gamma_jigsaw') and args.gamma_jigsaw > 0:
+            _, _, jigsaw_logits = model(processed_data['jigsaw'], jigsaw=True)
+            loss_jigsaw = F.cross_entropy(jigsaw_logits, processed_data['jigsaw_labels'])
+            loss_jigsaw = args.gamma_jigsaw * loss_jigsaw
+            total_loss += loss_jigsaw
+        
+        # 5. 遮擋重建任務
+        if hasattr(args, 'gamma_masked') and args.gamma_masked > 0:
+            original_feat, _, reconstructed_feat = model(processed_data['masked'], masked=True)
+            target_feat = model(processed_data['original'], is_feat=True)
+            loss_masked = F.mse_loss(reconstructed_feat, target_feat.detach())
+            loss_masked = args.gamma_masked * loss_masked
+            total_loss += loss_masked
+        
+        # 總損失
+        loss = loss_ce + loss_rot + loss_dist + total_loss
         acc = count_acc(train_logit, target)
 
-        # result
+        # 結果記錄
         tl.add(loss.item())
         ta.add(acc)
 
-        # backward
+        # 反向傳播
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -277,8 +375,11 @@ if __name__ == '__main__':
     parser.add_argument('--lr-decay-rate', type=float, default=0.1)
     parser.add_argument('--momentum', type=float, default=0.9)
     # ssl
-    parser.add_argument('--gamma-rot', type=float, default=0.0)
-    parser.add_argument('--gamma-dist', type=float, default=0.0)
+    parser.add_argument('--gamma-rot', type=float, default=2.5)
+    parser.add_argument('--gamma-dist', type=float, default=0.02)
+    # 新增任務參數
+    parser.add_argument('--gamma-jigsaw', type=float, default=0.02)
+    parser.add_argument('--gamma-masked', type=float, default=0.02)
     # dataset
     parser.add_argument('--dataset', default='mini', choices=['mini','tiered','cifarfs','fc100'])
     parser.add_argument('--size', type=int, default=84)
@@ -310,3 +411,4 @@ if __name__ == '__main__':
 
     end_time = datetime.datetime.now()
     print("End time :{} total ({})".format(end_time, end_time - start_time))
+
