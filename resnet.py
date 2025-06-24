@@ -183,6 +183,44 @@ class ResNet2d(nn.Module):
             self.classifier = nn.Linear(640, self.num_classes)
             # ssl
             self.rot_classifier = nn.Linear(640, 4)
+            # 新增任務分類器
+            self.jigsaw_classifier = nn.Linear(640, 100)  # 假設100種排列
+            #self.jigsaw_classifier = nn.Sequential(
+                #nn.Linear(640, 1280),
+                #nn.BatchNorm1d(1280),
+                #nn.ReLU(),
+                #nn.Dropout(0.15),
+    
+                #nn.Linear(1280, 640),
+                #nn.BatchNorm1d(640),
+                #nn.ReLU(),
+                #nn.Dropout(0.1),
+    
+                #nn.Linear(640, 320),
+                #nn.BatchNorm1d(320),
+               # nn.ReLU(),
+              #  nn.Dropout(0.1),
+    
+             #   nn.Linear(320, 100)  # 保持100種排列
+            #)
+            # 遮擋重建用解碼器
+            self.masked_decoder = nn.Sequential(
+                nn.Linear(640, 1280),
+                nn.ReLU(),
+                nn.Linear(1280, 640)  # 重建特徵
+            )
+#            self.masked_decoder = nn.Sequential(
+ #               nn.Linear(640, 1280),
+  #              nn.BatchNorm1d(1280),
+   #             nn.ReLU(), 
+    #            nn.Dropout(0.1),
+     #           nn.Linear(1280, 1280),
+      #          nn.BatchNorm1d(1280),
+       #         nn.ReLU(),
+        #        nn.Dropout(0.1),
+         #       nn.Linear(1280, 640),
+          #      nn.Tanh()
+           # )
         self.droplayer = nn.Dropout(0.2)
 
     def _make_layer(self, block, n_block, planes, stride=1, drop_rate=0.0, drop_block=False, block_size=1):
@@ -212,7 +250,7 @@ class ResNet2d(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, is_feat=False, ssl=False, drop=False):
+    def forward(self, x, is_feat=False, ssl=False, drop=False, jigsaw=False, masked=False):
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
@@ -220,14 +258,22 @@ class ResNet2d(nn.Module):
         if self.keep_avg_pool:
             x = self.avgpool(x)
         feat = x.view(x.size(0), -1)
+        
         if self.num_classes > 0:
             x = feat
             if drop:
                 x = self.droplayer(x)
             x = self.classifier(x)
+            
             if ssl:
-                xy = self.rot_classifier(feat)
-                return feat, x, xy
+                rot_logits = self.rot_classifier(feat)
+                return feat, x, rot_logits
+            elif jigsaw:
+                jigsaw_logits = self.jigsaw_classifier(feat)
+                return feat, x, jigsaw_logits
+            elif masked:
+                reconstructed_feat = self.masked_decoder(feat)
+                return feat, x, reconstructed_feat
             
             if is_feat:
                 return feat
